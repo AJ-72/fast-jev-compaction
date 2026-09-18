@@ -8,7 +8,12 @@ import {
   type AuditFs,
   type AuditRecord,
 } from '../src/audit.js';
-import { formatAuditReport, recordAttempt, resolveAuditPath } from '../hooks/fast-jev.ts';
+import {
+  auditLogPath,
+  formatAuditReport,
+  recordAttempt,
+  resolveAuditPath,
+} from '../hooks/fast-jev.ts';
 import type { CompactResult } from '../src/types.js';
 
 /** An in-memory `$.fs`, enough for the audit module. */
@@ -208,16 +213,7 @@ describe('resolveAuditPath', () => {
   });
 });
 
-/** A fake engine exposing only what `recordAttempt` touches. */
-function engine(fs: AuditFs, logs: string[] = []) {
-  return {
-    fs,
-    env: { get: async (name: string) => (name === 'HOME' ? '/home/t' : undefined) },
-    session: { id: async () => 'session-1' },
-    clock: { now: async () => Date.parse('2026-09-18T12:00:00.000Z') },
-    ui: { log: (text: string) => logs.push(text) },
-  };
-}
+const NOW = Date.parse('2026-09-18T12:00:00.000Z');
 
 const config = {
   compactAtPercent: 60,
@@ -230,9 +226,12 @@ const config = {
 describe('recordAttempt', () => {
   it('writes an applied record to the default path', async () => {
     const fs = memoryFs();
-    const record = await recordAttempt(engine(fs), config, {
+    const { record } = await recordAttempt(fs, config, {
       outcome: 'jev_applied',
       result: result(),
+      now: NOW,
+      sessionId: 'session-1',
+      path: auditLogPath(config, '/home/t'),
     });
 
     expect(record?.jevApplied).toBe(true);
@@ -244,16 +243,17 @@ describe('recordAttempt', () => {
 
   it('writes nothing when auditing is turned off', async () => {
     const fs = memoryFs();
-    const record = await recordAttempt(engine(fs), { ...config, auditLog: false }, {
+    const { record } = await recordAttempt(fs, { ...config, auditLog: false }, {
       outcome: 'jev_applied',
       result: result(),
+      now: NOW,
+      path: auditLogPath(config, '/home/t'),
     });
     expect(record).toBeUndefined();
     expect(fs.files.size).toBe(0);
   });
 
-  it('never throws when the filesystem fails, and says so in the log', async () => {
-    const logs: string[] = [];
+  it('never throws when the filesystem fails, and reports the reason', async () => {
     const fs: AuditFs = {
       read: async () => '',
       exists: async () => false,
@@ -261,60 +261,39 @@ describe('recordAttempt', () => {
         throw new Error('read-only volume');
       },
     };
-    await expect(
-      recordAttempt(engine(fs, logs), config, { outcome: 'jev_applied', result: result() }),
-    ).resolves.toBeDefined();
-    expect(logs.join(' ')).toContain('read-only volume');
-  });
-
-  it('reports, and does not throw, when the home directory is unknown', async () => {
-    const logs: string[] = [];
-    const fs = memoryFs();
-    const blind = { ...engine(fs, logs), env: { get: async () => undefined } };
-
-    await expect(
-      recordAttempt(blind, config, { outcome: 'jev_applied', result: result() }),
-    ).resolves.toBeUndefined();
-    expect(fs.files.size).toBe(0);
-    expect(logs.join(' ')).toMatch(/HOME|USERPROFILE/);
+    // The caller logs this through `$.ui.log`; the contract here is that the
+    // reason comes back rather than escaping as a throw.
+    const { error } = await recordAttempt(fs, config, {
+      outcome: 'jev_applied',
+      result: result(),
+      now: NOW,
+      path: auditLogPath(config, '/home/t'),
+    });
+    expect(error).toContain('read-only volume');
   });
 
   it('honours an explicit auditPath', async () => {
     const fs = memoryFs();
-    await recordAttempt(engine(fs), { ...config, auditPath: '/tmp/custom.jsonl' }, {
+    const withPath = { ...config, auditPath: '/tmp/custom.jsonl' };
+    await recordAttempt(fs, withPath, {
       outcome: 'error',
       fallbackReason: 'no key',
+      now: NOW,
+      path: auditLogPath(withPath, '/home/t'),
     });
     expect(fs.files.has('/tmp/custom.jsonl')).toBe(true);
   });
 });
 
-describe('formatAuditReport', () => {
-  it('explains an empty log rather than printing a bare zero', () => {
-    expect(formatAuditReport([], '/p/a.jsonl')).toContain('No compaction attempts recorded yet');
+describe('auditLogPath', () => {
+  it('throws when the home directory is unknown', () => {
+    // Moved here from recordAttempt: resolving the path is now the hook's
+    // job, so this is where an unknown home has to surface. The hook catches
+    // it and reports through `$.ui.log`.
+    expect(() => auditLogPath(config, undefined)).toThrow(/HOME|USERPROFILE/);
   });
 
-  it('reports counts, fallback reasons and Jev probabilities', () => {
-    const applied = buildAuditRecord({
-      timestamp: '2026-09-18T12:00:00.000Z',
-      pluginVersion: '0.3.0',
-      outcome: 'jev_applied',
-      model: 'jev-latest',
-      result: result(),
-    });
-    const failed = buildAuditRecord({
-      timestamp: '2026-09-18T12:05:00.000Z',
-      pluginVersion: '0.3.0',
-      outcome: 'error',
-      model: 'jev-latest',
-      fallbackReason: 'TYPESAFE_API_KEY is not configured',
-    });
-
-    const text = formatAuditReport([applied, failed], '/p/a.jsonl');
-    expect(text).toContain('Jev applied:         1');
-    expect(text).toContain('Errors:              1');
-    expect(text).toContain('TYPESAFE_API_KEY is not configured');
-    expect(text).toContain('2 calls judged');
-    expect(text).toContain('call=0.81');
+  it('leaves an absolute path alone, home or not', () => {
+    expect(auditLogPath({ ...config, auditPath: '/tmp/a.jsonl' }, undefined)).toBe('/tmp/a.jsonl');
   });
 });

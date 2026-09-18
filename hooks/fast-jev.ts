@@ -275,17 +275,20 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
-  $: {
-    env: { get: (name: string) => Promise<string | undefined> };
-    settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
-  },
+/**
+ * Picks the API key from the three places it may live, in precedence order.
+ *
+ * Takes the already-read env value and settings rather than the engine: `$`
+ * may not be bound to a name or passed, so every engine call is made at the
+ * hook's own call site and only plain values cross this boundary.
+ */
+export function pickApiKey(
   config: HookConfig,
-): Promise<string | undefined> {
+  fromEnv: string | undefined,
+  settings: Readonly<Record<string, unknown>>,
+): string | undefined {
   if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
   if (fromEnv) return fromEnv;
-  const settings = await $.settings.read();
   const env = settings['env'];
   if (env && typeof env === 'object') {
     const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
@@ -294,81 +297,62 @@ async function getApiKey(
   return undefined;
 }
 
-function notify(
-  $: {
-    ui: {
-      log: (text: string) => void;
-      toast: (text: string, options?: { timeoutMs?: number }) => void;
-    };
-  },
-  text: string,
-): void {
-  $.ui.log(text);
-  $.ui.toast(text, { timeoutMs: 15_000 });
-}
+/** How long a fallback notice stays on screen. */
+const NOTIFY_TIMEOUT_MS = 15_000;
 
-/** The slice of the engine the audit path uses. */
-type AuditEngine = {
-  fs: AuditFs;
-  env: { get: (name: string) => Promise<string | undefined> };
-  session: { id: () => Promise<string> };
-  clock: { now: () => Promise<number> };
-  ui: { log: (text: string) => void };
-};
-
-async function auditLogPath($: AuditEngine, config: HookConfig): Promise<string> {
+/**
+ * Resolves the audit log path from the configured value and the home dir.
+ *
+ * Takes `home` as a value rather than reading it from the engine: `$` may
+ * not be bound or passed, so the hook reads HOME/USERPROFILE itself.
+ */
+export function auditLogPath(config: HookConfig, home: string | undefined): string {
   const configured = config.auditPath || DEFAULT_AUDIT_PATH;
   if (!configured.startsWith('~')) return configured;
-  // USERPROFILE covers Windows, where HOME is usually unset.
-  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'));
   return resolveAuditPath(configured, home);
 }
 
 /**
- * Writes one audit record for a compaction attempt.
+ * Builds one audit record and appends it to the log.
  *
- * Deliberately swallows every failure: this is observability, and a plugin
- * that broke compaction because it could not write its own log would be worse
- * than one with no log at all. Problems surface in `$.ui.log` only.
+ * Takes the clock reading, session id, resolved path and an `AuditFs` as
+ * plain values: `$` is the engine boundary and may not be bound to a name,
+ * passed or read, so every engine call happens at the hook's own call site
+ * and this function stays drivable by the tests without an engine.
+ *
+ * Deliberately swallows every failure and reports it in the returned
+ * `error`: this is observability, and a plugin that broke compaction
+ * because it could not write its own log would be worse than one with no
+ * log at all.
  */
 export async function recordAttempt(
-  $: AuditEngine,
+  fs: AuditFs,
   config: HookConfig,
   input: {
     outcome: AuditOutcome;
+    now: number;
+    sessionId?: string;
+    path: string;
     result?: CompactResult;
     fallbackReason?: string;
   },
-): Promise<AuditRecord | undefined> {
-  if (!config.auditLog) return undefined;
+): Promise<{ record?: AuditRecord; error?: string }> {
+  if (!config.auditLog) return {};
   try {
-    const [now, sessionId, path] = await Promise.all([
-      $.clock.now(),
-      $.session.id().catch(() => undefined),
-      auditLogPath($, config),
-    ]);
     const record = buildAuditRecord({
-      timestamp: new Date(now).toISOString(),
+      timestamp: new Date(input.now).toISOString(),
       pluginVersion: PLUGIN_VERSION,
-      ...(sessionId ? { sessionId } : {}),
+      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       outcome: input.outcome,
       model: config.model,
       ...(input.result ? { result: input.result } : {}),
       ...(input.fallbackReason ? { fallbackReason: input.fallbackReason } : {}),
     });
-    // The engine rejects `$.fs` used as a value; `$` is only ever spelled
-    // `$.noun.event(...)` at a call site. Wrap each method in its own call.
-    const fs: AuditFs = {
-      read: (target) => $.fs.read(target),
-      write: (target, text) => $.fs.write(target, text),
-      exists: (target) => $.fs.exists(target),
-    };
-    const written = await appendAuditRecord(fs, path, record);
-    if (!written.written) $.ui.log(`audit log not written (${written.error})`);
-    return record;
+    const written = await appendAuditRecord(fs, input.path, record);
+    if (!written.written) return { record, error: written.error };
+    return { record };
   } catch (error) {
-    $.ui.log(`audit log skipped (${error instanceof Error ? error.message : String(error)})`);
-    return undefined;
+    return { error: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -420,8 +404,44 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let compacting = false;
 
   on('session.compact', async ($, event, next) => {
+    // Every engine call is spelled `$.noun.method(...)` here at the call
+    // site, and only plain values are handed to the helpers: `$` is the
+    // engine boundary and may not be bound to a name, passed or read.
+    const writeRecord = async (
+      config: HookConfig,
+      input: { outcome: AuditOutcome; result?: CompactResult; fallbackReason?: string },
+    ) => {
+      if (!config.auditLog) return;
+      try {
+        const [now, sessionId, home] = await Promise.all([
+          $.clock.now(),
+          $.session.id().catch(() => undefined),
+          $.env.get('HOME').then((value) => value ?? $.env.get('USERPROFILE')),
+        ]);
+        const path = auditLogPath(config, home);
+        const fs: AuditFs = {
+          read: (target) => $.fs.read(target),
+          write: (target, text) => $.fs.write(target, text),
+          exists: (target) => $.fs.exists(target),
+        };
+        const { error } = await recordAttempt(fs, config, { ...input, now, sessionId, path });
+        if (error) $.ui.log(`audit log not written (${error})`);
+      } catch (error) {
+        $.ui.log(`audit log skipped (${error instanceof Error ? error.message : String(error)})`);
+      }
+    };
+
+    const notify = (text: string) => {
+      $.ui.log(text);
+      $.ui.toast(text, { timeoutMs: NOTIFY_TIMEOUT_MS });
+    };
+
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      const [fromEnv, settings] = await Promise.all([
+        $.env.get('TYPESAFE_API_KEY'),
+        $.settings.read(),
+      ]);
+      const config = { ...configured, apiKey: pickApiKey(configured, fromEnv, settings) };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
@@ -429,20 +449,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         const reason = `below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}`;
-        await recordAttempt($ as unknown as AuditEngine, config, {
-          outcome: 'below_min_reduction',
-          result,
-          fallbackReason: reason,
-        });
-        notify($, `fallback to built-in summary (${reason})`);
+        await writeRecord(config, { outcome: 'below_min_reduction', result, fallbackReason: reason });
+        notify(`fallback to built-in summary (${reason})`);
         return next(event);
       }
-      await recordAttempt($ as unknown as AuditEngine, config, {
-        outcome: 'jev_applied',
-        result,
-      });
+      await writeRecord(config, { outcome: 'jev_applied', result });
       notify(
-        $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
       return { messages };
@@ -450,11 +462,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const reason = error instanceof Error ? error.message : String(error);
       // `configured`, not `config`: the failure may have been building `config`
       // itself (a rejected key lookup), and the audit settings are the same.
-      await recordAttempt($ as unknown as AuditEngine, configured, {
-        outcome: 'error',
-        fallbackReason: reason,
-      });
-      notify($, `fallback to built-in summary (${reason})`);
+      await writeRecord(configured, { outcome: 'error', fallbackReason: reason });
+      notify(`fallback to built-in summary (${reason})`);
       return next(event);
     }
   });
@@ -475,12 +484,9 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('command.run', async ($, event, next) => {
     if (event.command !== 'jev-audit') return next(event);
-    const engine = $ as unknown as AuditEngine;
     try {
-      const path = await auditLogPath(engine, configured);
-      // Spelled `$.fs.*(...)` directly rather than through the `engine`
-      // alias: the engine's call-site check is syntactic, so an aliased `$`
-      // is not guaranteed to satisfy it.
+      const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'));
+      const path = auditLogPath(configured, home);
       if (!(await $.fs.exists(path))) {
         return { text: formatAuditReport([], path) };
       }
