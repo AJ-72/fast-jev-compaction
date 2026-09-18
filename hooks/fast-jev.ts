@@ -356,7 +356,14 @@ export async function recordAttempt(
       ...(input.result ? { result: input.result } : {}),
       ...(input.fallbackReason ? { fallbackReason: input.fallbackReason } : {}),
     });
-    const written = await appendAuditRecord($.fs, path, record);
+    // The engine rejects `$.fs` used as a value; `$` is only ever spelled
+    // `$.noun.event(...)` at a call site. Wrap each method in its own call.
+    const fs: AuditFs = {
+      read: (target) => $.fs.read(target),
+      write: (target, text) => $.fs.write(target, text),
+      exists: (target) => $.fs.exists(target),
+    };
+    const written = await appendAuditRecord(fs, path, record);
     if (!written.written) $.ui.log(`audit log not written (${written.error})`);
     return record;
   } catch (error) {
@@ -471,10 +478,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
     const engine = $ as unknown as AuditEngine;
     try {
       const path = await auditLogPath(engine, configured);
-      if (!(await engine.fs.exists(path))) {
+      // Spelled `$.fs.*(...)` directly rather than through the `engine`
+      // alias: the engine's call-site check is syntactic, so an aliased `$`
+      // is not guaranteed to satisfy it.
+      if (!(await $.fs.exists(path))) {
         return { text: formatAuditReport([], path) };
       }
-      const records = parseAuditLog(await engine.fs.read(path));
+      const records = parseAuditLog(await $.fs.read(path));
       return { text: formatAuditReport(records, path) };
     } catch (error) {
       return {
