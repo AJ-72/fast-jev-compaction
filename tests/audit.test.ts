@@ -111,7 +111,7 @@ describe('buildAuditRecord', () => {
 describe('appendAuditRecord', () => {
   it('appends across calls and keeps the file valid JSONL', async () => {
     const fs = memoryFs();
-    const base = { timestamp: '2026-09-18T12:00:00.000Z', v: 1 as const, plugin: 'fast-jev-compaction', pluginVersion: '0.3.0', jevApplied: true };
+    const base = { timestamp: '2026-09-18T12:00:00.000Z', v: 1 as const, plugin: 'fast-jev-audit', pluginVersion: '0.3.0', jevApplied: true };
 
     await appendAuditRecord(fs, 'log.jsonl', { ...base, outcome: 'jev_applied' });
     await appendAuditRecord(fs, 'log.jsonl', { ...base, outcome: 'error', jevApplied: false });
@@ -125,7 +125,7 @@ describe('appendAuditRecord', () => {
     const record: AuditRecord = {
       timestamp: '2026-09-18T12:00:00.000Z',
       v: 1,
-      plugin: 'fast-jev-compaction',
+      plugin: 'fast-jev-audit',
       pluginVersion: '0.3.0',
       outcome: 'jev_applied',
       jevApplied: true,
@@ -150,7 +150,7 @@ describe('appendAuditRecord', () => {
     const outcome = await appendAuditRecord(fs, 'log.jsonl', {
       timestamp: 't',
       v: 1,
-      plugin: 'fast-jev-compaction',
+      plugin: 'fast-jev-audit',
       pluginVersion: '0.3.0',
       outcome: 'jev_applied',
       jevApplied: true,
@@ -237,7 +237,7 @@ describe('recordAttempt', () => {
 
     expect(record?.jevApplied).toBe(true);
     expect(record?.sessionId).toBe('session-1');
-    const written = fs.files.get('/home/t/.claude/fast-jev-compaction-audit.jsonl');
+    const written = fs.files.get('/home/t/.claude/fast-jev-audit.jsonl');
     expect(written).toBeDefined();
     expect(parseAuditLog(written ?? '')[0]?.outcome).toBe('jev_applied');
   });

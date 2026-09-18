@@ -31,9 +31,14 @@ hooks surface before installing or loading it:
 export CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1
 export TYPESAFE_API_KEY="<your TypeSafe key>"
 
-claude plugin marketplace add tamaratran/fast-jev-compaction
-claude plugin install fast-jev-compaction@fast-jev-compaction
+claude plugin marketplace add AJ-72/fast-jev-compaction
+claude plugin install fast-jev-audit@fast-jev-audit
 ```
+
+This is a fork of [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction)
+that adds the audit log described below. It is named `fast-jev-audit` so it can
+be installed alongside the original without colliding; run only one of the two,
+since both register a `session.compact` hook.
 
 For local development:
 
@@ -57,7 +62,7 @@ The plugin declares these `userConfig` values in
 | `truncateHeadChars` | `300` |
 | `model` | `jev-latest` |
 | `auditLog` | `true` |
-| `auditPath` | `~/.claude/fast-jev-compaction-audit.jsonl` |
+| `auditPath` | `~/.claude/fast-jev-audit.jsonl` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
@@ -85,14 +90,14 @@ an unreachable API degrades to the built-in summarizer with no lasting trace —
 compaction timing.
 
 Every compaction attempt therefore appends one JSON line to
-`~/.claude/fast-jev-compaction-audit.jsonl`, whatever the outcome:
+`~/.claude/fast-jev-audit.jsonl`, whatever the outcome:
 
 ```json
 {
   "timestamp": "2026-09-18T12:00:00.000Z",
   "v": 1,
-  "plugin": "fast-jev-compaction",
-  "pluginVersion": "0.3.0",
+  "plugin": "fast-jev-audit",
+  "pluginVersion": "0.3.1",
   "sessionId": "effdc594-...",
   "outcome": "jev_applied",
   "jevApplied": true,

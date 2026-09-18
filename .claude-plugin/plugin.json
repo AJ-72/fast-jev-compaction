@@ -1,7 +1,7 @@
 {
-  "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "name": "fast-jev-audit",
+  "version": "0.3.1",
+  "description": "Verbatim Jev-guided compaction, with a durable audit log proving whether Jev ran.",
   "license": "MIT",
   "userConfig": {
     "apiKey": {

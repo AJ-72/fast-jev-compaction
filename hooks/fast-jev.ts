@@ -37,13 +37,13 @@ const HOOK_DEFAULTS = {
 };
 
 /** This plugin's version, recorded with every audit entry. */
-const PLUGIN_VERSION = '0.3.0';
+const PLUGIN_VERSION = '0.3.1';
 
 /**
  * Default audit log location. Kept beside Claude Code's own configuration so
  * it survives plugin upgrades and is findable without knowing the cache path.
  */
-const DEFAULT_AUDIT_PATH = '~/.claude/fast-jev-compaction-audit.jsonl';
+const DEFAULT_AUDIT_PATH = '~/.claude/fast-jev-audit.jsonl';
 
 /**
  * Expands a leading `~`, or throws when the home directory is unknown.
@@ -372,7 +372,7 @@ export function formatAuditReport(records: readonly AuditRecord[], path: string)
   }
   const summary = summarizeAuditLog(records);
   const lines: string[] = [
-    `fast-jev-compaction audit  (${path})`,
+    `fast-jev-audit  (${path})`,
     '',
     `Attempts recorded:   ${summary.total}`,
     `Jev applied:         ${summary.jevApplied}`,

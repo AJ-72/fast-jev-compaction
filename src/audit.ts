@@ -105,7 +105,7 @@ export function buildAuditRecord(input: {
   const record: AuditRecord = {
     timestamp: input.timestamp,
     v: 1,
-    plugin: 'fast-jev-compaction',
+    plugin: 'fast-jev-audit',
     pluginVersion: input.pluginVersion,
     outcome: input.outcome,
     jevApplied: input.outcome === 'jev_applied',
