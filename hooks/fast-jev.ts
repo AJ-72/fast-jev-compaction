@@ -8,6 +8,15 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
+import {
+  appendAuditRecord,
+  buildAuditRecord,
+  parseAuditLog,
+  summarizeAuditLog,
+  type AuditFs,
+  type AuditOutcome,
+  type AuditRecord,
+} from '../src/audit.js';
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import type {
@@ -23,7 +32,38 @@ const HOOK_DEFAULTS = {
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
+  auditLog: true,
+  auditPath: '',
 };
+
+/** This plugin's version, recorded with every audit entry. */
+const PLUGIN_VERSION = '0.3.0';
+
+/**
+ * Default audit log location. Kept beside Claude Code's own configuration so
+ * it survives plugin upgrades and is findable without knowing the cache path.
+ */
+const DEFAULT_AUDIT_PATH = '~/.claude/fast-jev-compaction-audit.jsonl';
+
+/**
+ * Expands a leading `~`, or throws when the home directory is unknown.
+ *
+ * Stripping the `~` and writing a relative path instead would put the log in
+ * whatever directory the session happens to run in, so records would scatter
+ * across projects and `/jev-audit` would read a different file than the one
+ * just written - the log would look empty while appearing to work. Failing
+ * here is recoverable (the caller logs it and compaction continues); a log
+ * silently written somewhere else is not.
+ */
+export function resolveAuditPath(path: string, home: string | undefined): string {
+  if (!path.startsWith('~')) return path;
+  if (!home) {
+    throw new Error(
+      'cannot expand ~ in the audit path: neither HOME nor USERPROFILE is set; set auditPath to an absolute path',
+    );
+  }
+  return `${home.replace(/[/\\]$/, '')}/${path.slice(1).replace(/^[/\\]/, '')}`;
+}
 
 export type HookFetchInit = {
   method?: string;
@@ -45,7 +85,16 @@ export type HookConfig = CompactOptions & {
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
+  /** Write a durable record of every compaction attempt. Default true. */
+  auditLog: boolean;
+  /** Override the audit log location. Empty means the default path. */
+  auditPath: string;
 };
+
+function optionBoolean(options: PluginOptions, key: string, fallback: boolean): boolean {
+  const value = options[key];
+  return typeof value === 'boolean' ? value : fallback;
+}
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
   const value = options[key];
@@ -79,6 +128,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.minReductionRatio,
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    auditLog: optionBoolean(options, 'auditLog', HOOK_DEFAULTS.auditLog),
+    auditPath: optionString(options, 'auditPath') ?? HOOK_DEFAULTS.auditPath,
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
@@ -256,6 +307,107 @@ function notify(
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
+/** The slice of the engine the audit path uses. */
+type AuditEngine = {
+  fs: AuditFs;
+  env: { get: (name: string) => Promise<string | undefined> };
+  session: { id: () => Promise<string> };
+  clock: { now: () => Promise<number> };
+  ui: { log: (text: string) => void };
+};
+
+async function auditLogPath($: AuditEngine, config: HookConfig): Promise<string> {
+  const configured = config.auditPath || DEFAULT_AUDIT_PATH;
+  if (!configured.startsWith('~')) return configured;
+  // USERPROFILE covers Windows, where HOME is usually unset.
+  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'));
+  return resolveAuditPath(configured, home);
+}
+
+/**
+ * Writes one audit record for a compaction attempt.
+ *
+ * Deliberately swallows every failure: this is observability, and a plugin
+ * that broke compaction because it could not write its own log would be worse
+ * than one with no log at all. Problems surface in `$.ui.log` only.
+ */
+export async function recordAttempt(
+  $: AuditEngine,
+  config: HookConfig,
+  input: {
+    outcome: AuditOutcome;
+    result?: CompactResult;
+    fallbackReason?: string;
+  },
+): Promise<AuditRecord | undefined> {
+  if (!config.auditLog) return undefined;
+  try {
+    const [now, sessionId, path] = await Promise.all([
+      $.clock.now(),
+      $.session.id().catch(() => undefined),
+      auditLogPath($, config),
+    ]);
+    const record = buildAuditRecord({
+      timestamp: new Date(now).toISOString(),
+      pluginVersion: PLUGIN_VERSION,
+      ...(sessionId ? { sessionId } : {}),
+      outcome: input.outcome,
+      model: config.model,
+      ...(input.result ? { result: input.result } : {}),
+      ...(input.fallbackReason ? { fallbackReason: input.fallbackReason } : {}),
+    });
+    const written = await appendAuditRecord($.fs, path, record);
+    if (!written.written) $.ui.log(`audit log not written (${written.error})`);
+    return record;
+  } catch (error) {
+    $.ui.log(`audit log skipped (${error instanceof Error ? error.message : String(error)})`);
+    return undefined;
+  }
+}
+
+/** Renders the audit log for `/jev-audit`. */
+export function formatAuditReport(records: readonly AuditRecord[], path: string): string {
+  if (records.length === 0) {
+    return `No compaction attempts recorded yet.\nLog: ${path}\n\nThe log is written when a compaction runs, so an empty log means none has happened in this install.`;
+  }
+  const summary = summarizeAuditLog(records);
+  const lines: string[] = [
+    `fast-jev-compaction audit  (${path})`,
+    '',
+    `Attempts recorded:   ${summary.total}`,
+    `Jev applied:         ${summary.jevApplied}`,
+    `Below min reduction: ${summary.belowMinReduction}`,
+    `Errors:              ${summary.errors}`,
+  ];
+  if (summary.meanAppliedRatio !== null) {
+    lines.push(`Mean reduction:      ${Math.round(summary.meanAppliedRatio * 100)}% (applied only)`);
+  }
+  if (summary.fallbackReasons.length > 0) {
+    lines.push('', 'Fallback reasons seen (most recent first):');
+    for (const reason of summary.fallbackReasons.slice(0, 5)) lines.push(`  - ${reason}`);
+  }
+  lines.push('', 'Most recent attempts:');
+  for (const record of records.slice(-10)) {
+    const when = record.timestamp.slice(0, 19).replace('T', ' ');
+    const ratio = record.reduction ? `${Math.round(record.reduction.ratio * 100)}%` : '-';
+    const proof = record.jev
+      ? `jev: ${record.jev.requests} req, ${record.jev.callsJudged} calls judged, ${record.jev.ms}ms`
+      : 'jev: not reached';
+    lines.push(`  ${when}  ${record.outcome.padEnd(20)} ${ratio.padStart(5)}  ${proof}`);
+  }
+  const withScores = records.filter((r) => r.sample && r.sample.length > 0).pop();
+  if (withScores?.sample) {
+    lines.push(
+      '',
+      `Jev scores from ${withScores.timestamp.slice(0, 19).replace('T', ' ')} (probabilities, not computable locally):`,
+    );
+    for (const s of withScores.sample.slice(0, 8)) {
+      lines.push(`  ${s.id} ${s.tool.padEnd(12)} call=${s.keepCall.toFixed(2)} result=${s.keepResult.toFixed(2)} -> ${s.action}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
@@ -269,23 +421,65 @@ export const register: Register = (on: On, options: PluginOptions) => {
       });
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        notify(
-          $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
-        );
+        const reason = `below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}`;
+        await recordAttempt($ as unknown as AuditEngine, config, {
+          outcome: 'below_min_reduction',
+          result,
+          fallbackReason: reason,
+        });
+        notify($, `fallback to built-in summary (${reason})`);
         return next(event);
       }
+      await recordAttempt($ as unknown as AuditEngine, config, {
+        outcome: 'jev_applied',
+        result,
+      });
       notify(
         $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
       return { messages };
     } catch (error) {
-      notify(
-        $,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      // `configured`, not `config`: the failure may have been building `config`
+      // itself (a rejected key lookup), and the audit settings are the same.
+      await recordAttempt($ as unknown as AuditEngine, configured, {
+        outcome: 'error',
+        fallbackReason: reason,
+      });
+      notify($, `fallback to built-in summary (${reason})`);
       return next(event);
+    }
+  });
+
+  // `/jev-audit` reads the log back. Registering on session.start rather than
+  // at module load keeps it out of the way when the plugin is disabled mid-run.
+  on('session.start', async ($, event, next) => {
+    try {
+      await $.command.register({
+        name: 'jev-audit',
+        description: 'Show proof of whether Jev handled recent compactions.',
+      });
+    } catch (error) {
+      $.ui.log(`/jev-audit unavailable (${error instanceof Error ? error.message : String(error)})`);
+    }
+    return next(event);
+  });
+
+  on('command.run', async ($, event, next) => {
+    if (event.command !== 'jev-audit') return next(event);
+    const engine = $ as unknown as AuditEngine;
+    try {
+      const path = await auditLogPath(engine, configured);
+      if (!(await engine.fs.exists(path))) {
+        return { text: formatAuditReport([], path) };
+      }
+      const records = parseAuditLog(await engine.fs.read(path));
+      return { text: formatAuditReport(records, path) };
+    } catch (error) {
+      return {
+        text: `Could not read the audit log (${error instanceof Error ? error.message : String(error)}).`,
+      };
     }
   });
 

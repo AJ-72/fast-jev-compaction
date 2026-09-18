@@ -56,6 +56,8 @@ The plugin declares these `userConfig` values in
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
 | `model` | `jev-latest` |
+| `auditLog` | `true` |
+| `auditPath` | `~/.claude/fast-jev-compaction-audit.jsonl` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
@@ -73,6 +75,53 @@ reduction, per-reason counts, state size and request count; a per-call
 `turn.complete` hook requests
 compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.
+
+## Confirming the plugin ran
+
+The toast and the `decisions:` line report what happened, but both vanish with
+the session. Because the fallback path is silent by design — a missing key or
+an unreachable API degrades to the built-in summarizer with no lasting trace —
+"is Jev actually doing this?" is otherwise answerable only by inference from
+compaction timing.
+
+Every compaction attempt therefore appends one JSON line to
+`~/.claude/fast-jev-compaction-audit.jsonl`, whatever the outcome:
+
+```json
+{
+  "timestamp": "2026-09-18T12:00:00.000Z",
+  "v": 1,
+  "plugin": "fast-jev-compaction",
+  "pluginVersion": "0.3.0",
+  "sessionId": "effdc594-...",
+  "outcome": "jev_applied",
+  "jevApplied": true,
+  "jev": { "model": "jev-latest", "requests": 2, "ms": 1340,
+           "stateTokens": 8000, "stateStage": "full", "callsJudged": 12 },
+  "reduction": { "charsBefore": 120323, "charsAfter": 32689, "ratio": 0.7284, "...": 0 },
+  "sample": [{ "id": "t1", "tool": "Read", "action": "drop_result",
+               "keepCall": 0.81, "keepResult": 0.12 }]
+}
+```
+
+`outcome` is one of `jev_applied`, `below_min_reduction` or `error`; the latter
+two carry `fallbackReason`, which is the piece the toast used to throw away.
+
+Two fields are the actual proof, as opposed to a claim the plugin makes about
+itself:
+
+- **`jev.requests`** is non-zero only after an HTTP response was parsed, so it
+  separates "Jev answered" from "the hook ran and failed".
+- **`sample[].keepCall` / `keepResult`** are probabilities returned by the
+  model. Nothing in this plugin computes them, so their presence — and their
+  spread across calls — is evidence a real judgement happened rather than a
+  local heuristic.
+
+Run **`/jev-audit`** to read the log back as counts, fallback reasons and the
+most recent per-call scores. Set `auditLog` to `false` to turn the log off, or
+`auditPath` to move it. The log is capped at the newest 500 records, and a
+failure to write it is logged but never converts a working compaction into a
+fallback.
 
 ## Scope and caveat
 

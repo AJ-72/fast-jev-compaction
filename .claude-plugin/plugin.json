@@ -57,6 +57,18 @@
       "title": "Jev model",
       "description": "TypeSafe Jev model name.",
       "default": "jev-latest"
+    },
+    "auditLog": {
+      "type": "boolean",
+      "title": "Write audit log",
+      "description": "Record every compaction attempt, and whether Jev handled it, to a JSONL log. Read it with /jev-audit.",
+      "default": true
+    },
+    "auditPath": {
+      "type": "string",
+      "title": "Audit log path",
+      "description": "Where to write the audit log. Leave unset for ~/.claude/fast-jev-compaction-audit.jsonl.",
+      "default": ""
     }
   }
 }
